@@ -388,7 +388,7 @@ def genSpoof_list( dir_meta,is_train=False,is_eval=False):
             spk, key,_,_,label = line.strip().split(' ')
             utt2spk[key] = spk
             file_list.append(key)
-            d_meta[key] = 1 if label == 'bonafide' else 0
+            d_meta[key] = 0 if label == 'bonafide' else 1
         return d_meta,file_list,utt2spk
     
     elif(is_eval):
@@ -401,7 +401,7 @@ def genSpoof_list( dir_meta,is_train=False,is_eval=False):
             spk, key,_,_,label = line.strip().split(' ')
             utt2spk[key] = spk
             file_list.append(key)
-            d_meta[key] = 1 if label == 'bonafide' else 0
+            d_meta[key] = 0 if label == 'bonafide' else 1
         return d_meta,file_list,utt2spk
 
 
