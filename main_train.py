@@ -3,13 +3,13 @@ import torch.nn as nn
 import argparse
 import os
 import json
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm, trange
 import AASIST
 from Model import DownStreamLinearClassifier
 from DatasetUtils import genSpoof_list, Dataset_ASVspoof2019_train  # ASVspoof dataset utils
 from evaluate_tDCF_asvspoof19 import compute_eer
-
+import random
 class NegativeQueue:
     """
     Implements a queue for storing negative samples for contrastive learning.
@@ -105,6 +105,10 @@ def contrastive_loss(features_q: torch.Tensor, features_k: torch.Tensor, negativ
     features_k = features_k / features_k.norm(dim=1, keepdim=True)
     negatives = negatives / negatives.norm(dim=1, keepdim=True)
 
+    print(f"Features Q: {features_q}")
+    print(f"Features K: {features_k}")
+    print(f"Negatives: {negatives}")
+
     pos_sim = torch.exp(torch.sum(features_q * features_k, dim=-1) / temperature)
     neg_sim = torch.exp(torch.matmul(features_q, negatives.T) / temperature)
 
@@ -131,8 +135,13 @@ def length_loss(features: torch.Tensor, labels: torch.Tensor, margin: float) -> 
     """
     real_features = features[labels == 0]
     fake_features = features[labels == 1]
+    print(labels)
+    print(f'真實人聲大小: {real_features.shape}')
+    print(f'合成人聲大小: {fake_features.shape}')
     real_loss = torch.norm(real_features, p=2, dim=1).mean()
     fake_loss = torch.relu(margin - torch.norm(fake_features, p=2, dim=1)).mean()
+    print(f'真實人聲 Loss: {real_loss}')
+    print(f'合成人聲 Loss: {fake_loss}')
     return real_loss + fake_loss
 
 def validate(
@@ -186,6 +195,10 @@ def validate(
             loss_cl = contrastive_loss(features, features, negatives, temperature=args.temperature)
             loss_len = length_loss(features, labels, margin=4.0)
             loss_ce = cross_entropy_criterion(logits, labels)
+            
+            print(f"驗證集對比式學習 Loss: {loss_cl}")
+            print(f"驗證集長度 Loss: {loss_len}")
+            print(f"驗證集 Cross Entropy Loss: {loss_ce}")
 
             # 總損失計算
             total_loss += (loss_cl + args.length_loss_weight * loss_len + args.cross_entropy_weight * loss_ce).item() * audio_input.size(0)
@@ -196,6 +209,8 @@ def validate(
             # 儲存分數和標籤
             score_loader.append(features[:, 1])
             label_loader.append(labels)
+
+        print(f"驗證集 Cross Total Loss: {total_loss}")
 
         # 計算 EER
         scores = torch.cat(score_loader, 0).data.cpu().numpy()
@@ -248,6 +263,7 @@ def train(args, device):
         cut_length=cut_length,
         utt2spk=utt2spk
     )
+    # 訓練集一定要洗牌，否則計算 length loss 會有 Nan 問題
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=8)
     train_flow = iter(train_loader)
     d_label_trn, file_dev, utt2spk = genSpoof_list(
@@ -261,7 +277,8 @@ def train(args, device):
         cut_length=cut_length,
         utt2spk=utt2spk
     )
-    validation_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=8)
+     # 資料集需要洗牌，同上問題
+    validation_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=8)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.cosine_annealing_epochs)
@@ -293,8 +310,31 @@ def train(args, device):
             loss_cl = contrastive_loss(features, features, negatives, temperature=args.temperature)
             loss_len = length_loss(features, labels, margin=args.margin)
             loss_ce = cross_entropy_criterion(logits, labels)
+            
+            print(f"訓練集對比式學習 Loss: {loss_cl}")
+            print(f"訓練集長度 Loss: {loss_len}")
+            print(f"訓練集 Cross Entropy Loss: {loss_ce}")
 
-            loss = loss_cl + args.length_loss_weight * loss_len + args.cross_entropy_weight * loss_ce
+            # 預防 Loss NaN的問題，順便紀錄哪一個 Loss 出錯
+            if not torch.isnan(loss_cl):
+                loss += loss_cl
+            else:
+                print("Contrastive loss is NaN, ignoring this term.")
+
+            if not torch.isnan(loss_len):
+                loss += args.length_loss_weight * loss_len
+            else:
+                print("Length loss is NaN, ignoring this term.")
+
+            if not torch.isnan(loss_ce):
+                loss += args.cross_entropy_weight * loss_ce
+            else:
+                print("Cross-entropy loss is NaN, ignoring this term.")
+
+            print(f"訓練集 Total Loss: {loss}")
+            if torch.isnan(loss):
+                print(f"NaN loss encountered at step {i}, skipping update.")
+                continue
 
             optimizer.zero_grad()
             loss.backward()
