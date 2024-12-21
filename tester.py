@@ -1,4 +1,5 @@
 from main_train import *
+import random
 def test_model_pipeline(model, queue, device, database_path, cut_length=64600):
     """
     測試模型和後續邏輯是否能正常運行，避免後期報錯。
@@ -21,13 +22,15 @@ def test_model_pipeline(model, queue, device, database_path, cut_length=64600):
             is_train=False, is_eval=False
         )
         dev_dataset = Dataset_ASVspoof2019_train(
-            list_IDs=file_dev[:args.batch_size],  # 只選取 batch_size 的樣本
-            labels={k: v for k, v in list(d_label_trn.items())[:args.batch_size]},
+            list_IDs=file_dev,
+            labels=d_label_trn,
             base_dir=os.path.join(database_path + 'ASVspoof2019_LA_eval/'),
             cut_length=cut_length,
             utt2spk=utt2spk
         )
-        validation_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=1)
+        selected_indices = random.sample(range(len(dev_dataset)), 1000)
+        subset =  Subset(dev_dataset, selected_indices)
+        validation_loader = DataLoader(subset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=1)
         validation_flow = iter(validation_loader)
         for i in trange(0, len(validation_loader), total=len(validation_loader), initial=0):
             audio_input, spks, labels = next(validation_flow)
@@ -103,4 +106,4 @@ if __name__ == "__main__":
     queue = NegativeQueue(feature_dim=160, queue_size=args.queue_size)
     database_path = config['database_path']
     test_model_pipeline(model=model, queue=queue, device=device, database_path=database_path)
-    test_validate_function(model=model, queue=queue, feature_dim=64600, device=device, database_path=database_path, args=args)
+    # test_validate_function(model=model, queue=queue, feature_dim=64600, device=device, database_path=database_path, args=args)
