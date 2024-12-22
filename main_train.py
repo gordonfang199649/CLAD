@@ -4,11 +4,12 @@ import argparse
 import os
 import json
 from torch.utils.data import DataLoader, Subset
+from torch.nn.functional import softmax
 from tqdm import tqdm, trange
 import AASIST
 from Model import DownStreamLinearClassifier
 from DatasetUtils import genSpoof_list, Dataset_ASVspoof2019_train  # ASVspoof dataset utils
-from evaluate_tDCF_asvspoof19 import compute_eer
+from evaluate_tDCF_asvspoof19 import compute_eer_frr_far
 import random
 class NegativeQueue:
     """
@@ -86,14 +87,14 @@ def initParams() -> argparse.Namespace:
     parser.add_argument('--seed', type=int, help="Random seed", default=42)
     parser.add_argument('--output_path', type=str, help="Output folder", default='./models/')
     parser.add_argument('--model', type=str, choices=['encoder'], default='encoder', help="Model architecture")
-    parser.add_argument('--batch_size', type=int, default=32, help="Batch size")
-    parser.add_argument('--num_epochs', type=int, default=10, help="Number of epochs")
+    parser.add_argument('--batch_size', type=int, default=64, help="Batch size")
+    parser.add_argument('--num_epochs', type=int, default=5, help="Number of epochs")
     parser.add_argument('--learning_rate', type=float, default=0.0005, help="Learning rate")
     parser.add_argument('--temperature', type=float, default=0.07, help="Temperature for contrastive loss")
     parser.add_argument('--margin', type=float, default=4.0, help="Margin for length loss")
     parser.add_argument('--queue_size', type=int, default=6144, help="Queue size for negative samples")
     parser.add_argument('--weight_decay', type=float, default=0.0001, help="Weight decay for optimizer")
-    parser.add_argument('--cosine_annealing_epochs', type=int, default=10, help="Number of epochs for cosine annealing")
+    parser.add_argument('--cosine_annealing_epochs', type=int, default=5, help="Number of epochs for cosine annealing")
     parser.add_argument('--length_loss_weight', type=float, default=2.0, help="Weight for length loss in final loss computation")
     parser.add_argument('--cross_entropy_weight', type=float, default=1.0, help="Weight for cross-entropy loss in downstream task")
 
@@ -104,10 +105,6 @@ def contrastive_loss(features_q: torch.Tensor, features_k: torch.Tensor, negativ
     features_q = features_q / features_q.norm(dim=1, keepdim=True)
     features_k = features_k / features_k.norm(dim=1, keepdim=True)
     negatives = negatives / negatives.norm(dim=1, keepdim=True)
-
-    print(f"Features Q: {features_q}")
-    print(f"Features K: {features_k}")
-    print(f"Negatives: {negatives}")
 
     pos_sim = torch.exp(torch.sum(features_q * features_k, dim=-1) / temperature)
     neg_sim = torch.exp(torch.matmul(features_q, negatives.T) / temperature)
@@ -135,7 +132,6 @@ def length_loss(features: torch.Tensor, labels: torch.Tensor, margin: float) -> 
     """
     real_features = features[labels == 0]
     fake_features = features[labels == 1]
-    print(labels)
     print(f'真實人聲大小: {real_features.shape}')
     print(f'合成人聲大小: {fake_features.shape}')
     real_loss = torch.norm(real_features, p=2, dim=1).mean()
@@ -201,31 +197,49 @@ def validate(
             print(f"驗證集 Cross Entropy Loss: {loss_ce}")
 
             # 總損失計算
-            total_loss += (loss_cl + args.length_loss_weight * loss_len + args.cross_entropy_weight * loss_ce).item() * audio_input.size(0)
+            # 預防 Loss NaN的問題，順便紀錄哪一個 Loss 出錯
+            loss = 0
+            if not torch.isnan(loss_cl):
+                loss += loss_cl
+            else:
+                print("Contrastive loss is NaN, ignoring this term.")
+
+            if not torch.isnan(loss_len):
+                loss += args.length_loss_weight * loss_len
+            else:
+                print("Length loss is NaN, ignoring this term.")
+
+            if not torch.isnan(loss_ce):
+                loss += args.cross_entropy_weight * loss_ce
+            else:
+                print("Cross-entropy loss is NaN, ignoring this term.")
+            total_loss += loss
             total_samples += audio_input.size(0)
 
             queue.dequeue_and_enqueue(features, labels)
             
             # 儲存分數和標籤
-            score_loader.append(features[:, 1])
+            scores = softmax(logits, dim=1)[:, 0]
+            score_loader.append(scores)
             label_loader.append(labels)
 
-        print(f"驗證集 Cross Total Loss: {total_loss}")
+        average_loss = total_loss / total_samples
+        print(f"驗證集 Cross Total Loss: {average_loss}")
 
         # 計算 EER
         scores = torch.cat(score_loader, 0).data.cpu().numpy()
         labels = torch.cat(label_loader, 0).data.cpu().numpy()
-        eer, threshold = compute_eer(scores[labels == 0], scores[labels == 1])
+        eer, frr, far, threshold = compute_eer_frr_far(scores[labels == 0], scores[labels == 1])
 
         # 儲存日誌
         save_path = os.path.join(args.output_path)
         os.makedirs(save_path, exist_ok = True)
         
         with open(os.path.join(args.output_path, "dev_loss.log"), "a") as log:
-            log.write(f"{epoch_num}\t{eer}\t{threshold}\n")
+            log.write(f"epoch: {epoch_num}\t EER: {eer}\t FRR: {frr}\t FAR: {far}\t Threshold: {threshold}\t Loss: {average_loss}\n")
         print(f"Validation EER: {eer:.4f}")
 
-    return total_loss / total_samples
+    return eer, average_loss
 
 
 def preprocess_audio(audio_input: torch.Tensor, target_length: int = 64600) -> torch.Tensor:
@@ -283,7 +297,7 @@ def train(args, device):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.cosine_annealing_epochs)
 
-    best_val_loss = float('inf')
+    best_val_eer= float('inf')
     best_model_path = os.path.join(args.output_path, "best_model.pth")
 
     queue = NegativeQueue(feature_dim=160, queue_size=args.queue_size)
@@ -316,6 +330,7 @@ def train(args, device):
             print(f"訓練集 Cross Entropy Loss: {loss_ce}")
 
             # 預防 Loss NaN的問題，順便紀錄哪一個 Loss 出錯
+            loss = 0
             if not torch.isnan(loss_cl):
                 loss += loss_cl
             else:
@@ -348,7 +363,7 @@ def train(args, device):
         avg_loss = total_loss / len(train_loader.dataset)
         print(f"Epoch {epoch+1}, Training Loss: {avg_loss:.4f}")
 
-        val_loss = validate(model, validation_loader, device, queue, epoch + 1, args)
+        val_eer, val_loss = validate(model, validation_loader, device, queue, epoch + 1, args)
         print(f"Epoch {epoch+1}, Validation Loss: {val_loss:.4f}")
 
         scheduler.step()
@@ -356,8 +371,8 @@ def train(args, device):
         os.makedirs(save_path, exist_ok = True)
         torch.save(model, os.path.join(save_path,
                                         'anti-spoofing_feat_model_%d.pt' % (epoch+1)))
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_eer < best_val_eer:
+            best_val_eer = val_eer
             torch.save(model, best_model_path)
             print(f"Best model saved at epoch {epoch+1}")
 

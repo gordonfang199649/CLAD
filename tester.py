@@ -68,13 +68,13 @@ def test_validate_function(model, queue, feature_dim, device, args, database_pat
             is_train=False, is_eval=False
         )
         dev_dataset = Dataset_ASVspoof2019_train(
-            list_IDs=file_dev[:args.batch_size],  # 只選取 batch_size 的樣本
-            labels={k: v for k, v in list(d_label_trn.items())[:args.batch_size]},
+            list_IDs=file_dev,  # 只選取 batch_size 的樣本
+            labels=d_label_trn,
             base_dir=os.path.join(database_path + 'ASVspoof2019_LA_eval/'),
             cut_length=cut_length,
             utt2spk=utt2spk
         )
-        validation_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=1)
+        validation_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=8)
 
         # 3. 執行 validate 函數
         total_loss = validate(model, validation_loader, device, queue, epoch_num=1, args=args)
@@ -98,12 +98,14 @@ if __name__ == "__main__":
         
     with open(config['aasist_config_path'], "r") as f_json:
         aasist_config = json.loads(f_json.read())
-    aasist_model_config = aasist_config["model_config"]
-    aasist_encoder = AASIST.AasistEncoder(aasist_model_config).to(device)
-    downstream_model = DownStreamLinearClassifier(aasist_encoder, input_depth=160)
-    model = downstream_model.to(device)
+    # aasist_model_config = aasist_config["model_config"]
+    # aasist_encoder = AASIST.AasistEncoder(aasist_model_config).to(device)
+    # downstream_model = DownStreamLinearClassifier(aasist_encoder, input_depth=160)
+    # model = downstream_model.to(device)
+    
+    model = torch.load('./models/checkpoint/anti-spoofing_feat_model_5.pt').to(device)
     
     queue = NegativeQueue(feature_dim=160, queue_size=args.queue_size)
     database_path = config['database_path']
-    test_model_pipeline(model=model, queue=queue, device=device, database_path=database_path)
-    # test_validate_function(model=model, queue=queue, feature_dim=64600, device=device, database_path=database_path, args=args)
+    # test_model_pipeline(model=model, queue=queue, device=device, database_path=database_path)
+    test_validate_function(model=model, queue=queue, feature_dim=64600, device=device, database_path=database_path, args=args)

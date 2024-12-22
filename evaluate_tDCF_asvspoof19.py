@@ -56,6 +56,13 @@ def compute_eer(target_scores, nontarget_scores):
     eer = np.mean((frr[min_index], far[min_index]))
     return eer, thresholds[min_index]
 
+def compute_eer_frr_far(target_scores, nontarget_scores):
+    """ Returns equal error rate (EER) and the corresponding threshold. """
+    frr, far, thresholds = compute_det_curve(target_scores, nontarget_scores)
+    abs_diffs = np.abs(frr - far)
+    min_index = np.argmin(abs_diffs)
+    eer = np.mean((frr[min_index], far[min_index]))
+    return eer, frr, far, thresholds[min_index]
 
 def compute_tDCF(bonafide_score_cm, spoof_score_cm, Pfa_asv, Pmiss_asv, Pmiss_spoof_asv, cost_model, print_cost):
     """
