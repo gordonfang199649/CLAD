@@ -3,16 +3,14 @@ import torch.nn as nn
 import argparse
 import os
 import json
-from torch.utils.data import DataLoader, Subset, ConcatDataset
+from torch.utils.data import DataLoader, Subset
 from torch.nn.functional import softmax
-from tqdm import trange
+from tqdm import tqdm, trange
 import AASIST
 from Model import DownStreamLinearClassifier
+from DatasetUtils import genSpoof_list, Dataset_ASVspoof2019_train  # ASVspoof dataset utils
 from evaluate_tDCF_asvspoof19 import compute_eer_frr_far
 import random
-import pandas as pd
-from dataloader import RawAudio
-
 class NegativeQueue:
     """
     Implements a queue for storing negative samples for contrastive learning.
@@ -85,24 +83,21 @@ def initParams() -> argparse.Namespace:
         argparse.Namespace: Parsed arguments.
     """
     parser = argparse.ArgumentParser(description="CLAD Model Training")
-    parser.add_argument('--name', type = str, required = True)
-    parser.add_argument('--upsample_num', type=int, help="real utterance augmentation number", default=0)
-    parser.add_argument('--downsample_num', type=int, help="fake utterance augmentation number", default=0)
-    parser.add_argument('-nb_worker', type = int, default = 8)
+    parser.add_argument('--name', type=str, help="Dataset name", default='')
     parser.add_argument('--seed', type=int, help="Random seed", default=42)
     parser.add_argument('--output_path', type=str, help="Output folder", default='./models/')
     parser.add_argument('--model', type=str, choices=['encoder'], default='encoder', help="Model architecture")
-    parser.add_argument('--batch_size', type=int, default=16, help="Batch size")
-    parser.add_argument('--num_epochs', type=int, default=3, help="Number of epochs")
+    parser.add_argument('--batch_size', type=int, default=64, help="Batch size")
+    parser.add_argument('--num_epochs', type=int, default=5, help="Number of epochs")
     parser.add_argument('--learning_rate', type=float, default=0.0005, help="Learning rate")
     parser.add_argument('--temperature', type=float, default=0.07, help="Temperature for contrastive loss")
     parser.add_argument('--margin', type=float, default=4.0, help="Margin for length loss")
     parser.add_argument('--queue_size', type=int, default=6144, help="Queue size for negative samples")
     parser.add_argument('--weight_decay', type=float, default=0.0001, help="Weight decay for optimizer")
-    parser.add_argument('--cosine_annealing_epochs', type=int, default=3, help="Number of epochs for cosine annealing")
+    parser.add_argument('--cosine_annealing_epochs', type=int, default=5, help="Number of epochs for cosine annealing")
     parser.add_argument('--length_loss_weight', type=float, default=2.0, help="Weight for length loss in final loss computation")
     parser.add_argument('--cross_entropy_weight', type=float, default=1.0, help="Weight for cross-entropy loss in downstream task")
-    parser.add_argument('-nb_samp', type = int, default = 64600)
+
     args = parser.parse_args()
     return args
 
@@ -179,13 +174,12 @@ def validate(
     with torch.no_grad():
         for i in trange(0, len(validation_loader), total=len(validation_loader), initial=0):
             try:
-                audio_input, labels = next(validation_flow)
+                audio_input, spks, labels = next(validation_flow)
             except StopIteration:
                 validation_flow = iter(validation_loader)
-                audio_input, labels = next(validation_flow)
+                audio_input, spks, labels = next(validation_flow)
                 
-            #audio_input = preprocess_audio(audio_input.squeeze(1).to(device))
-            audio_input = audio_input.to(device)
+            audio_input = preprocess_audio(audio_input.squeeze(1).to(device))
             labels = labels.to(device)
             features = model.encoder(audio_input)
             logits = model(audio_input)
@@ -238,7 +232,7 @@ def validate(
         eer, frr, far, threshold = compute_eer_frr_far(scores[labels == 0], scores[labels == 1])
 
         # 儲存日誌
-        save_path = os.path.join(args.output_path, args.name)
+        save_path = os.path.join(args.output_path)
         os.makedirs(save_path, exist_ok = True)
         
         with open(os.path.join(args.output_path, "dev_loss.log"), "a") as log:
@@ -267,62 +261,39 @@ def train(args, device):
     aasist_encoder = AASIST.AasistEncoder(aasist_model_config).to(device)
     downstream_model = DownStreamLinearClassifier(aasist_encoder, input_depth=160)
     model = downstream_model.to(device)
+
     momentum_updater = MomentumUpdater(model.encoder)
-    
-    # 訓練集
-    training_set = RawAudio(path_to_database=f'../datasets/{args.name}'
-                            , meta_csv = 'meta.csv'
-                            , nb_samp=args.nb_samp
-                            , return_label=True
-                            , part = 'train')
-    
-    # 分離真實人聲和假人聲
-    meta = pd.read_csv(f'../datasets/{args.name}/train/meta.csv')
-    real_indices = meta[meta['label'] == 'bonafide'].index.tolist()
-    spoof_indices = meta[meta['label'] == 'spoof'].index.tolist()
-    
-    # 如果需要下採樣假人聲
-    if args.downsample_num > 0 and len(spoof_indices) > args.downsample_num:
-        selected_spoof_indices = random.sample(spoof_indices, args.downsample_num)
-    else:
-        selected_spoof_indices = spoof_indices  # 如果不需要下採樣，保留所有假人聲
 
-    # 新的數據集(下採樣假人聲)
-    real_subset = Subset(training_set, real_indices)
-    spoof_subset = Subset(training_set, selected_spoof_indices)
-    training_set = ConcatDataset([real_subset, spoof_subset])
-    
-    # 如果需要從 LibriSpeech 上採樣真實人聲
-    if args.upsample_num > 0:
-        training_set_real_utterance =  RawAudio(path_to_database=f'../datasets/LibriSpeech'
-                            , meta_csv = 'meta.csv'
-                            , return_label=True
-                            , nb_samp=args.nb_samp
-                            , part = 'train')
-        selected_bonafide_indices = random.sample(range(len(training_set_real_utterance)), args.upsample_num)
-        bonafide_subset =  Subset(training_set_real_utterance, selected_bonafide_indices)
-        training_set = ConcatDataset([training_set, bonafide_subset])
-        
-    train_loader = DataLoader(training_set,
-                                  batch_size=args.batch_size,
-                                  shuffle=True,
-                                  drop_last=False,
-                                  num_workers=args.nb_worker)
+    database_path = config['database_path']
+    cut_length = 64600
+    d_label_trn, file_train, utt2spk = genSpoof_list(
+        dir_meta=database_path + "ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.train.trn.txt", 
+        is_train=True, is_eval=False
+    )
+    train_dataset = Dataset_ASVspoof2019_train(
+        list_IDs=file_train,
+        labels=d_label_trn,
+        base_dir=os.path.join(database_path + 'ASVspoof2019_LA_train/'),
+        cut_length=cut_length,
+        utt2spk=utt2spk
+    )
+    # 訓練集一定要洗牌，否則計算 length loss 會有 Nan 問題
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=8)
     train_flow = iter(train_loader)
+    d_label_trn, file_dev, utt2spk = genSpoof_list(
+        dir_meta=database_path + "ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.dev.trl.txt", 
+        is_train=False, is_eval=False
+    )
+    dev_dataset = Dataset_ASVspoof2019_train(
+        list_IDs=file_dev,
+        labels=d_label_trn,
+        base_dir=os.path.join(database_path + 'ASVspoof2019_LA_dev/'),
+        cut_length=cut_length,
+        utt2spk=utt2spk
+    )
+     # 資料集需要洗牌，同上問題
+    validation_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=8)
     
-    # 驗證集
-    validation_set = RawAudio(path_to_database=f'../datasets/{args.name}'
-                            , meta_csv = 'meta.csv'
-                            , return_label=True
-                            , nb_samp=args.nb_samp
-                            , part = 'validation')
-    
-    validation_loader = DataLoader(validation_set,
-                                  batch_size=args.batch_size,
-                                  shuffle=True,
-                                  drop_last=False,
-                                  num_workers=args.nb_worker)
-
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.cosine_annealing_epochs)
 
@@ -338,13 +309,12 @@ def train(args, device):
         total_loss = 0
         for i in trange(0, len(train_loader), total=len(train_loader), initial=0):
             try:
-                audio_input, labels = next(train_flow)
+                audio_input, spks, labels = next(train_flow)
             except StopIteration:
                 train_flow = iter(train_loader)
-                audio_input, labels = next(train_flow)
+                audio_input, spks, labels = next(train_flow)
             
-            #audio_input = preprocess_audio(audio_input.squeeze(1).to(device))
-            audio_input = audio_input.to(device)
+            audio_input = preprocess_audio(audio_input.squeeze(1).to(device))
             labels = labels.to(device)
             features = model.encoder(audio_input)
             logits = model(audio_input)
@@ -397,7 +367,7 @@ def train(args, device):
         print(f"Epoch {epoch+1}, Validation Loss: {val_loss:.4f}")
 
         scheduler.step()
-        save_path = os.path.join(args.output_path, args.name, 'checkpoint')
+        save_path = os.path.join(args.output_path, 'checkpoint')
         os.makedirs(save_path, exist_ok = True)
         torch.save(model, os.path.join(save_path,
                                         'anti-spoofing_feat_model_%d.pt' % (epoch+1)))
@@ -408,17 +378,7 @@ def train(args, device):
 
 if __name__ == "__main__":
     args = initParams()
-
-    # 檢查可用 CUDA 設備
     cuda = torch.cuda.is_available()
     print('Cuda device available: ', cuda)
-    device = torch.device("cuda" if cuda else "cpu")
-
-    # 印出當前 CUDA_VISIBLE_DEVICES 的設備
-    if cuda:
-        print(f"Using device: {torch.cuda.current_device()}, Name: {torch.cuda.get_device_name(0)}")
-    else:
-        print("Running on CPU.")
-
-    # 啟動訓練
+    device = torch.device("cuda:0" if cuda else "cpu")
     train(args, device)

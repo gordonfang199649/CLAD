@@ -269,54 +269,84 @@ def train(args, device):
     model = downstream_model.to(device)
     momentum_updater = MomentumUpdater(model.encoder)
     
-    # 訓練集
-    training_set = RawAudio(path_to_database=f'../datasets/{args.name}'
+    # 加載三個主要數據集
+    training_sets = {
+        "DFADD": RawAudio(path_to_database=f'../datasets/DFADD'
                             , meta_csv = 'meta.csv'
-                            , nb_samp=args.nb_samp
-                            , return_label=True
+                            , return_label=True, nb_samp=args.nb_samp
+                            , part = 'train'),
+        "CodecFake": RawAudio(path_to_database=f'../datasets/CodecFake'
+                            , meta_csv = 'meta.csv'
+                            , return_label=True, nb_samp=args.nb_samp
+                            , part = 'train'),
+        "ASVspoof2021_DF": RawAudio(path_to_database=f'../datasets/ASVspoof2021_DF'
+                            , meta_csv = 'meta.csv'
+                            , return_label=True, nb_samp=args.nb_samp
                             , part = 'train')
-    
-    # 分離真實人聲和假人聲
-    meta = pd.read_csv(f'../datasets/{args.name}/train/meta.csv')
-    real_indices = meta[meta['label'] == 'bonafide'].index.tolist()
-    spoof_indices = meta[meta['label'] == 'spoof'].index.tolist()
-    
-    # 如果需要下採樣假人聲
-    if args.downsample_num > 0 and len(spoof_indices) > args.downsample_num:
-        selected_spoof_indices = random.sample(spoof_indices, args.downsample_num)
-    else:
-        selected_spoof_indices = spoof_indices  # 如果不需要下採樣，保留所有假人聲
+    }
 
-    # 新的數據集(下採樣假人聲)
-    real_subset = Subset(training_set, real_indices)
-    spoof_subset = Subset(training_set, selected_spoof_indices)
-    training_set = ConcatDataset([real_subset, spoof_subset])
-    
-    # 如果需要從 LibriSpeech 上採樣真實人聲
-    if args.upsample_num > 0:
-        training_set_real_utterance =  RawAudio(path_to_database=f'../datasets/LibriSpeech'
-                            , meta_csv = 'meta.csv'
-                            , return_label=True
-                            , nb_samp=args.nb_samp
-                            , part = 'train')
-        selected_bonafide_indices = random.sample(range(len(training_set_real_utterance)), args.upsample_num)
-        bonafide_subset =  Subset(training_set_real_utterance, selected_bonafide_indices)
-        training_set = ConcatDataset([training_set, bonafide_subset])
+    # 定義下採樣目標數量
+    TARGET_FAKE_COUNT = 126321
+
+    # 初始化訓練集列表
+    training_set_list = []
+
+    # 遍歷每個數據集
+    for name, training_set in training_sets.items():
+        # 加載 meta 信息
+        meta = pd.read_csv(f'../datasets/{name}/train/meta.csv')
         
-    train_loader = DataLoader(training_set,
+        # 獲取真實和假人聲的索引
+        real_indices = meta[meta['label'] == 'bonafide'].index.tolist()
+        spoof_indices = meta[meta['label'] == 'spoof'].index.tolist()
+
+        # 下採樣假人聲
+        if len(spoof_indices) > TARGET_FAKE_COUNT:
+            selected_spoof_indices = random.sample(spoof_indices, TARGET_FAKE_COUNT)
+        else:
+            selected_spoof_indices = spoof_indices
+
+        # 創建子數據集
+        real_subset = Subset(training_set, real_indices)
+        spoof_subset = Subset(training_set, selected_spoof_indices)
+        
+        # 合併真實和假樣本
+        adjusted_set = ConcatDataset([real_subset, spoof_subset])
+        training_set_list.append(adjusted_set)
+
+    # 加載 LibriSpeech 數據集
+    librispeech_set = RawAudio(path_to_database=f'../datasets/LibriSpeech'
+                            , meta_csv = 'meta.csv'
+                            , return_label=True, nb_samp=args.nb_samp
+                            , part = 'train')
+    training_set_list.append(librispeech_set)
+
+    # 合併所有數據集
+    final_training_set = ConcatDataset(training_set_list)
+
+    # 創建 DataLoader
+    train_loader = DataLoader(final_training_set,
                                   batch_size=args.batch_size,
                                   shuffle=True,
                                   drop_last=False,
                                   num_workers=args.nb_worker)
     train_flow = iter(train_loader)
-    
-    # 驗證集
-    validation_set = RawAudio(path_to_database=f'../datasets/{args.name}'
+
+    # 驗證集處理
+    validation_set_list = [RawAudio(path_to_database=f'../datasets/DFADD'
                             , meta_csv = 'meta.csv'
-                            , return_label=True
-                            , nb_samp=args.nb_samp
+                            , return_label=True, nb_samp=args.nb_samp
                             , part = 'validation')
-    
+                        ,RawAudio(path_to_database=f'../datasets/CodecFake'
+                            , meta_csv = 'meta.csv'
+                            , return_label=True, nb_samp=args.nb_samp
+                            , part = 'validation')
+                        , RawAudio(path_to_database=f'../datasets/ASVspoof2021_DF'
+                            , meta_csv = 'meta.csv'
+                            , return_label=True, nb_samp=args.nb_samp
+                            , part = 'validation')]
+    # 合併所有數據集
+    validation_set = ConcatDataset(validation_set_list)
     validation_loader = DataLoader(validation_set,
                                   batch_size=args.batch_size,
                                   shuffle=True,
@@ -408,17 +438,7 @@ def train(args, device):
 
 if __name__ == "__main__":
     args = initParams()
-
-    # 檢查可用 CUDA 設備
     cuda = torch.cuda.is_available()
     print('Cuda device available: ', cuda)
-    device = torch.device("cuda" if cuda else "cpu")
-
-    # 印出當前 CUDA_VISIBLE_DEVICES 的設備
-    if cuda:
-        print(f"Using device: {torch.cuda.current_device()}, Name: {torch.cuda.get_device_name(0)}")
-    else:
-        print("Running on CPU.")
-
-    # 啟動訓練
+    device = torch.device("cuda:0" if cuda else "cpu")
     train(args, device)
