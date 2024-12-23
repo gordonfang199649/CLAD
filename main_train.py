@@ -12,78 +12,15 @@ from evaluate_tDCF_asvspoof19 import compute_eer_frr_far
 import random
 import pandas as pd
 from dataloader import RawAudio
+from TrainingUtils import NegativeQueue, MomentumUpdater
 
-class NegativeQueue:
-    """
-    Implements a queue for storing negative samples for contrastive learning.
-    """
-    def __init__(self, feature_dim: int, queue_size: int):
-        self.queue = torch.randn(queue_size, feature_dim).cuda()
-        self.queue = self.queue / self.queue.norm(dim=1, keepdim=True)  # 歸一化
-        self.ptr = queue_size  # 初始化時將 ptr 設置為 queue_size，視為已填滿
-        self.queue_size = queue_size
-        self.labels = torch.ones(queue_size).cuda()  # 初始化為負樣本標籤
-
-    def dequeue_and_enqueue(self, features: torch.Tensor, labels: torch.Tensor) -> None:
-        negative_features = features[labels == 1]  # 選取負樣本
-        if negative_features.size(0) == 0:  # 如果沒有負樣本，直接返回
-            return
-
-        negative_features = negative_features / negative_features.norm(dim=1, keepdim=True)  # 歸一化
-        batch_size = negative_features.size(0)
-
-        if batch_size > self.queue_size:
-            self.queue = negative_features[-self.queue_size:].detach()
-            self.ptr = 0
-        else:
-            end_ptr = (self.ptr + batch_size) % self.queue_size
-            if end_ptr < self.ptr:
-                self.queue[self.ptr:] = negative_features[:self.queue_size - self.ptr].detach()
-                self.queue[:end_ptr] = negative_features[self.queue_size - self.ptr:].detach()
-            else:
-                self.queue[self.ptr:end_ptr] = negative_features.detach()
-            self.ptr = end_ptr
-
-    def get_negatives(self) -> torch.Tensor:
-        """
-        Returns negative samples from the queue.
-
-        Returns:
-            torch.Tensor: Negative samples.
-        """
-        return self.queue
-
-
-class MomentumUpdater:
-    """
-    Updates the parameters of a momentum-based encoder.
-    """
-    def __init__(self, model: nn.Module, momentum: float = 0.999):
-        self.model = model
-        self.momentum = momentum
-        self.shadow = {name: param.clone().detach() for name, param in model.named_parameters()}
-
-    def update(self, new_model: nn.Module) -> None:
-        """
-        Updates the parameters of the shadow model using momentum.
-
-        Args:
-            new_model (nn.Module): The model with updated parameters.
-        """
-        with torch.no_grad():
-            for name, param in new_model.named_parameters():
-                if name in self.shadow:
-                    self.shadow[name] = self.momentum * self.shadow[name] + (1 - self.momentum) * param.data
-                    param.data = self.shadow[name]
-
-
-def initParams() -> argparse.Namespace:
-    """
-    Initializes and parses command-line arguments for the training script.
+"""
+    給 CommandLine 下的超參數與指令
 
     Returns:
         argparse.Namespace: Parsed arguments.
-    """
+"""
+def initParams() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CLAD Model Training")
     parser.add_argument('--name', type = str, required = True)
     parser.add_argument('--upsample_num', type=int, help="real utterance augmentation number", default=0)
@@ -106,6 +43,17 @@ def initParams() -> argparse.Namespace:
     args = parser.parse_args()
     return args
 
+"""
+    計算對比式學習 Loss
+
+    Args:
+        features_q (torch.Tensor): 模型萃取人聲表徵
+        features_k (torch.Tensor): 模型萃取人聲表徵
+        negatives (torch.Tensor): 負向樣本
+        temperature (float): temperature
+    Returns:
+        torch.Tensor: Length loss.
+"""
 def contrastive_loss(features_q: torch.Tensor, features_k: torch.Tensor, negatives: torch.Tensor, temperature: float) -> torch.Tensor:
     features_q = features_q / features_q.norm(dim=1, keepdim=True)
     features_k = features_k / features_k.norm(dim=1, keepdim=True)
@@ -122,19 +70,18 @@ def contrastive_loss(features_q: torch.Tensor, features_k: torch.Tensor, negativ
     loss = -torch.log(pos_sim / (pos_sim + neg_sim_sum))
     return loss.mean()
 
-
-def length_loss(features: torch.Tensor, labels: torch.Tensor, margin: float) -> torch.Tensor:
-    """
-    Computes length loss for real and fake features.
+"""
+    計算真假人聲長度 Loss
 
     Args:
-        features (torch.Tensor): Features of audio samples.
-        labels (torch.Tensor): Corresponding labels for the features.
+        features (torch.Tensor): 模型萃取人聲表徵
+        labels (torch.Tensor): 真假人聲標籤
         margin (float): Margin for the loss calculation.
 
     Returns:
         torch.Tensor: Length loss.
-    """
+"""
+def length_loss(features: torch.Tensor, labels: torch.Tensor, margin: float) -> torch.Tensor:
     real_features = features[labels == 0]
     fake_features = features[labels == 1]
     print(f'真實人聲大小: {real_features.shape}')
@@ -145,6 +92,21 @@ def length_loss(features: torch.Tensor, labels: torch.Tensor, margin: float) -> 
     print(f'合成人聲 Loss: {fake_loss}')
     return real_loss + fake_loss
 
+"""
+    執行驗證集
+
+    Args:
+        model (nn.Module): Detection 模型
+        validation_loader (DataLoader): 驗證集資料容器
+        device (torch.device): GPU 設備
+        queue (NegativeQueue): Negative sample queue.
+        epoch_num (int): Current epoch number.
+        args (argparse.Namespace): Parsed command-line arguments.
+
+    Returns:
+        eer 驗證集計算下來的 EER
+        average_loss 平均 Loss
+"""
 def validate(
     model: nn.Module,
     validation_loader: DataLoader,
@@ -153,20 +115,6 @@ def validate(
     epoch_num: int,
     args
 ) -> float:
-    """
-    Validates the model on the validation dataset.
-
-    Args:
-        model (nn.Module): The trained model.
-        validation_loader (DataLoader): Validation dataset loader.
-        device (torch.device): Device for computation.
-        queue (NegativeQueue): Negative sample queue.
-        epoch_num (int): Current epoch number.
-        args (argparse.Namespace): Parsed command-line arguments.
-
-    Returns:
-        float: Average validation loss.
-    """
     model.eval()
     total_loss = 0
     total_samples = 0
@@ -183,8 +131,8 @@ def validate(
             except StopIteration:
                 validation_flow = iter(validation_loader)
                 audio_input, labels = next(validation_flow)
-                
-            #audio_input = preprocess_audio(audio_input.squeeze(1).to(device))
+            # 音頻前處理交給 RawAudio 類去實作
+            # audio_input = preprocess_audio(audio_input.squeeze(1).to(device))
             audio_input = audio_input.to(device)
             labels = labels.to(device)
             features = model.encoder(audio_input)
@@ -241,13 +189,25 @@ def validate(
         save_path = os.path.join(args.output_path, args.name)
         os.makedirs(save_path, exist_ok = True)
         
-        with open(os.path.join(args.output_path, "dev_loss.log"), "a") as log:
+        with open(os.path.join(args.output_path, args.name, "validation_loss.log"), "a") as log:
             log.write(f"epoch: {epoch_num}\t EER: {eer}\t FRR: {frr}\t FAR: {far}\t Threshold: {threshold}\t Loss: {average_loss}\n")
         print(f"Validation EER: {eer:.4f}")
 
     return eer, average_loss
 
-
+"""
+    前處理音頻
+    1. 取樣 64600 個採樣點，通常音頻是 16kHz， 64600/16000 大約是 4 秒時間
+    2. 音頻不足 4 秒則重複片段填充
+    3. 音頻超過 4 秒則截斷超過片段
+    
+    Args:
+    audio_input (torch.Tensor): 聲音 raw data
+    target_length (int): 採樣數
+    
+    Returns:
+    處理過後的音頻片段
+"""
 def preprocess_audio(audio_input: torch.Tensor, target_length: int = 64600) -> torch.Tensor:
     if audio_input.shape[-1] < target_length:
         repeat_factor = int(target_length / audio_input.shape[-1]) + 1
@@ -256,7 +216,17 @@ def preprocess_audio(audio_input: torch.Tensor, target_length: int = 64600) -> t
         audio_input = audio_input[:, :target_length]
     return audio_input
 
-def train(args, device):
+"""
+    執行訓練集
+
+    Args:
+        args (argparse.Namespace): Parsed command-line arguments.
+        device (torch.device): GPU 設備
+
+    Returns:
+
+"""
+def train(args, device)->None:
     torch.manual_seed(args.seed)
     with open("./config.conf", "r") as f_json:
         config = json.loads(f_json.read())
@@ -327,7 +297,7 @@ def train(args, device):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.cosine_annealing_epochs)
 
     best_val_eer= float('inf')
-    best_model_path = os.path.join(args.output_path, "best_model.pth")
+    best_model_path = os.path.join(args.output_path, args.name, "best_model.pth")
 
     queue = NegativeQueue(feature_dim=160, queue_size=args.queue_size)
 
@@ -342,8 +312,8 @@ def train(args, device):
             except StopIteration:
                 train_flow = iter(train_loader)
                 audio_input, labels = next(train_flow)
-            
-            #audio_input = preprocess_audio(audio_input.squeeze(1).to(device))
+            # 音頻前處理交給 RawAudio 類去實作
+            # audio_input = preprocess_audio(audio_input.squeeze(1).to(device))
             audio_input = audio_input.to(device)
             labels = labels.to(device)
             features = model.encoder(audio_input)
@@ -406,6 +376,9 @@ def train(args, device):
             torch.save(model, best_model_path)
             print(f"Best model saved at epoch {epoch+1}")
 
+"""
+    主程式入口點
+"""
 if __name__ == "__main__":
     args = initParams()
 
