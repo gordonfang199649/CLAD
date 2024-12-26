@@ -59,15 +59,15 @@ def contrastive_loss(features_q: torch.Tensor, features_k: torch.Tensor, negativ
     features_k = features_k / features_k.norm(dim=1, keepdim=True)
     negatives = negatives / negatives.norm(dim=1, keepdim=True)
 
-    pos_sim = torch.exp(torch.sum(features_q * features_k, dim=-1) / temperature)
-    neg_sim = torch.exp(torch.matmul(features_q, negatives.T) / temperature)
+    real_utterance_similarity = torch.exp(torch.sum(features_q * features_k, dim=-1) / temperature)
+    fake_utterance_similarity = torch.exp(torch.matmul(features_q, negatives.T) / temperature)
 
     # 避免數值不穩定
     epsilon = 1e-8  # 平滑項
-    pos_sim = torch.clamp(pos_sim, min=epsilon)
-    neg_sim_sum = torch.clamp(neg_sim.sum(dim=-1), min=epsilon)
+    real_utterance_similarity = torch.clamp(real_utterance_similarity, min=epsilon)
+    fake_utterance_similarity_sum = torch.clamp(fake_utterance_similarity.sum(dim=-1), min=epsilon)
 
-    loss = -torch.log(pos_sim / (pos_sim + neg_sim_sum))
+    loss = -torch.log(real_utterance_similarity / (real_utterance_similarity + fake_utterance_similarity_sum))
     return loss.mean()
 
 """
@@ -81,16 +81,31 @@ def contrastive_loss(features_q: torch.Tensor, features_k: torch.Tensor, negativ
     Returns:
         torch.Tensor: Length loss.
 """
-def length_loss(features: torch.Tensor, labels: torch.Tensor, margin: float) -> torch.Tensor:
-    real_features = features[labels == 0]
-    fake_features = features[labels == 1]
+def length_loss(features: torch.Tensor, labels: torch.Tensor, margin: float, weight: float = 1.0) -> torch.Tensor:
+    # 假音頻標籤為 1
+    fake_features = features[labels == 1]  # 假音頻（合成人聲）
+    # 真音頻標籤為 0
+    real_features = features[labels == 0]  # 真音頻
+
     print(f'真實人聲大小: {real_features.shape}')
     print(f'合成人聲大小: {fake_features.shape}')
-    real_loss = torch.norm(real_features, p=2, dim=1).mean()
+    
+    # 真實音頻損失：讓 norm 趨近於 0
+    real_loss = weight * torch.norm(real_features, p=2, dim=1).mean()
+    # 假音頻損失：讓 norm 超過 margin
     fake_loss = torch.relu(margin - torch.norm(fake_features, p=2, dim=1)).mean()
+    
     print(f'真實人聲 Loss: {real_loss}')
     print(f'合成人聲 Loss: {fake_loss}')
+    
     return real_loss + fake_loss
+
+
+def split_features(features: torch.Tensor, labels: torch.Tensor):
+    fake_utterance_features = features[labels == 1]
+    real_utterance_features = features[labels == 0]
+    return real_utterance_features, fake_utterance_features
+
 
 """
     執行驗證集
@@ -111,7 +126,6 @@ def validate(
     model: nn.Module,
     validation_loader: DataLoader,
     device: torch.device,
-    queue: NegativeQueue,
     epoch_num: int,
     args
 ) -> float:
@@ -123,7 +137,8 @@ def validate(
     label_loader = []
 
     validation_flow = iter(validation_loader)
-    
+    queue = NegativeQueue(feature_dim=160, queue_size=args.queue_size)
+
     with torch.no_grad():
         for i in trange(0, len(validation_loader), total=len(validation_loader), initial=0):
             try:
@@ -138,11 +153,14 @@ def validate(
             features = model.encoder(audio_input)
             logits = model(audio_input)
 
-            # 負樣本隊列
+            # 將假人聲加入 Queue
+            queue.dequeue_and_enqueue(features, labels)
+            # 再 Queue 提取
             negatives = queue.get_negatives()
 
             # 損失計算
-            loss_cl = contrastive_loss(features, features, negatives, temperature=args.temperature)
+            real_utterance_samples, _ = split_features(features=features, labels=labels)
+            loss_cl = contrastive_loss(real_utterance_samples, real_utterance_samples, negatives, temperature=args.temperature)
             loss_len = length_loss(features, labels, margin=4.0)
             loss_ce = cross_entropy_criterion(logits, labels)
             
@@ -170,8 +188,6 @@ def validate(
             total_loss += loss
             total_samples += audio_input.size(0)
 
-            queue.dequeue_and_enqueue(features, labels)
-            
             # 儲存分數和標籤
             scores = softmax(logits, dim=1)[:, 0]
             score_loader.append(scores)
@@ -190,7 +206,7 @@ def validate(
         os.makedirs(save_path, exist_ok = True)
         
         with open(os.path.join(args.output_path, args.name, "validation_loss.log"), "a") as log:
-            log.write(f"epoch: {epoch_num}\t EER: {eer}\t FRR: {frr}\t FAR: {far}\t Threshold: {threshold}\t Loss: {average_loss}\n")
+            log.write(f"dataset: {args.name}\t epoch: {epoch_num}\t EER: {eer}\t FRR: {frr}\t FAR: {far}\t Threshold: {threshold}\t Loss: {average_loss}\n")
         print(f"Validation EER: {eer:.4f}")
 
     return eer, average_loss
@@ -319,9 +335,13 @@ def train(args, device)->None:
             features = model.encoder(audio_input)
             logits = model(audio_input)
 
+            # 將假人聲加入 Queue
+            queue.dequeue_and_enqueue(features, labels)
+            # 再 Queue 提取
             negatives = queue.get_negatives()
-
-            loss_cl = contrastive_loss(features, features, negatives, temperature=args.temperature)
+            
+            real_utterance_samples, _ = split_features(features=features, labels=labels)
+            loss_cl = contrastive_loss(real_utterance_samples, real_utterance_samples, negatives, temperature=args.temperature)
             loss_len = length_loss(features, labels, margin=args.margin)
             loss_ce = cross_entropy_criterion(logits, labels)
             
@@ -355,7 +375,7 @@ def train(args, device)->None:
             loss.backward()
             optimizer.step()
 
-            queue.dequeue_and_enqueue(features, labels)
+            
             momentum_updater.update(model.encoder)
 
             total_loss += loss.item() * audio_input.size(0)
@@ -363,7 +383,7 @@ def train(args, device)->None:
         avg_loss = total_loss / len(train_loader.dataset)
         print(f"Epoch {epoch+1}, Training Loss: {avg_loss:.4f}")
 
-        val_eer, val_loss = validate(model, validation_loader, device, queue, epoch + 1, args)
+        val_eer, val_loss = validate(model, validation_loader, device, epoch + 1, args)
         print(f"Epoch {epoch+1}, Validation Loss: {val_loss:.4f}")
 
         scheduler.step()
